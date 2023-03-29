@@ -1,0 +1,51 @@
+[package]
+edition = "2021"
+name = "format"
+version = "0.0.1"
+
+[dependencies]
+anyhow = "1.0.69"
+eframe = { version = "0.21.3", features = ["persistence", "wgpu"] }
+egui = "0.21.0"
+egui_extras = { version = "0.21.0", features = ["svg"] }
+getrandom = { version = "0.2.8", features = ["js"] }
+image = { version = "0.24.5", default-features = false, features = [
+    "png",
+    "tiff",
+] }
+indexmap = { version = "1.9.2", features = ["serde"] }
+itertools = "0.10.5"
+ndarray = "0.15.6"
+ndarray-stats = "0.5.1"
+noisy_float = "0.2.0"
+nom = "7.1.3"
+num-traits = "0.2.15"
+plotters = "0.3.4"
+serde = { version = "1.0.152", features = ["derive"] }
+tracing = "0.1.37"
+uom = "0.34.0"
+
+# arrayfire = "3.8.0"
+# egui_dock = "0.4.0"
+# egui-dropdown = "0.1.0"
+# finitediff = "0.1.4"
+# ordered-float = { version = "3.4.0", default-features = false }
+# rawpointer = "0.2.1"
+# smoothed_z_score = "0.1.3"
+
+# Native
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tracing-subscriber = "0.3.16"
+
+# Wasm
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1.7"
+tracing-wasm = "0.2.1"
+wasm-bindgen-futures = "0.4.34"
+
+[profile.release]
+opt-level = 2
+
+# Optimize all dependencies even in debug builds:
+[profile.dev.package."*"]
+opt-level = 2
