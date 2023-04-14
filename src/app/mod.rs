@@ -1,13 +1,13 @@
 use self::{
     bounder::Bounded,
-    config::{Mesh, Svg},
+    config::{Bounds, Config, Descriptions},
     normalizer::Normalized,
 };
 use crate::{
     parser::Parsed,
     utils::{with_index, BoundExt, Display, DroppedFileExt, RangeBoundsExt, UiExt},
 };
-use anyhow::{Error, Result};
+use anyhow::{anyhow, Context as _, Error, Result};
 use eframe::{
     epaint::Hsva,
     get_value,
@@ -25,8 +25,8 @@ use egui::{
     text::LayoutJob,
     warn_if_debug_build, Align, Align2, CentralPanel, Color32, ColorImage, Context, DragValue,
     DroppedFile, FontData, FontDefinitions, FontFamily, FontId, Id, LayerId, Layout, Order,
-    Response, RichText, SidePanel, Slider, TextEdit, TextStyle, TopBottomPanel, Ui, Vec2,
-    WidgetText, Window,
+    Response, RichText, ScrollArea, SidePanel, Slider, TextEdit, TextStyle, TopBottomPanel, Ui,
+    Vec2, WidgetText, Window,
 };
 use egui_extras::RetainedImage;
 use image::{imageops::*, ColorType, DynamicImage, GrayImage, ImageResult, RgbaImage};
@@ -34,7 +34,11 @@ use indexmap::{indexmap, IndexMap};
 use ndarray::{Array1, Dimension};
 use ndarray_stats::{interpolate::Linear, Quantile1dExt};
 use noisy_float::types::n64;
-use plotters::{prelude::*, style::RelativeSize};
+use plotters::{
+    backend::{PixelFormat, RGBPixel},
+    prelude::*,
+    style::RelativeSize,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -141,38 +145,6 @@ fn setup_fonts(ctx: &Context) {
     ctx.set_fonts(fonts);
 }
 
-mod config {
-    use serde::{Deserialize, Serialize};
-
-    /// Mesh
-    #[derive(Deserialize, Serialize)]
-    pub(super) struct Mesh {
-        pub(super) x_desc: String,
-        pub(super) y_desc: String,
-    }
-
-    impl Default for Mesh {
-        fn default() -> Self {
-            Self {
-                x_desc: "m/z".to_string(),
-                y_desc: "Blabalbla %".to_string(),
-            }
-        }
-    }
-
-    // Size
-    #[derive(Clone, Copy, Deserialize, Serialize)]
-    pub(super) struct Svg {
-        pub(super) size: (u32, u32),
-    }
-
-    impl Default for Svg {
-        fn default() -> Self {
-            Self { size: (1920, 1080) }
-        }
-    }
-}
-
 #[derive(Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct App {
@@ -184,30 +156,21 @@ pub struct App {
 
     left_panel: bool,
 
-    // Filter
-    bounds: Bounds,
-
     // Visual
     // font: &'static str,
-    svg: Svg,
+    config: Config,
     test: u32,
-    x_label_area_size: f64,
-    y_label_area_size: f64,
-    margin: f64,
-    tick_mark_size: f64,
-    stroke_width: u32,
-    mesh: Mesh,
+    // x_label_area_size: f64,
+    // y_label_area_size: f64,
+    // margin: f64,
+    // tick_mark_size: f64,
+    // stroke_width: u32,
+    // mesh: Descriptions,
 
-    margin1: u32,
-
-    visuals: Visuals,
+    // margin1: u32,
+    // visuals: Visuals,
     labels: Vec<Label>,
     points: Vec<Point>,
-
-    window_size: Vec2,
-    plot_size: [f32; 4],
-    save_plot: bool,
-    plot_to_save: Option<ColorImage>,
 
     #[serde(skip)]
     errors: Errors,
@@ -302,328 +265,361 @@ impl App {
                 });
                 ui.separator();
                 let desired_size = ui.available_size();
-                let svg = self.svg(ui).unwrap();
-                RetainedImage::from_svg_bytes("chart", &svg)
-                    .unwrap()
-                    .show_size(ui, desired_size);
+                let rgb = self.rgb(ui).unwrap().show_size(ui, desired_size);
+                // let svg = self.svg(ui).unwrap().show_size(ui, desired_size);
             }
         });
-        // Save plot
-        if let Some(image) = self.plot_to_save.take() {
-            let path = Path::new("temp_plot.png");
-            match save_image(&image, &path) {
-                Ok(_) => {
-                    println!("saving ok!")
-                }
-                Err(error) => {
-                    println!("failed to plot to {:?}: {:?}", path, error);
-                }
-            }
-        }
     }
 
     fn left_panel(&mut self, ctx: &Context) {
         SidePanel::left("left_panel").show_animated(ctx, self.left_panel, |ui| {
-            ui.heading("Left Panel");
-            ui.separator();
-            // Chart
-            ui.collapsing(WidgetText::from("Chart").heading(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Size:");
-                    ui.add(DragValue::new(&mut self.svg.size.0).speed(1))
-                        .on_hover_text("X");
-                    ui.add(DragValue::new(&mut self.svg.size.1).speed(1))
-                        .on_hover_text("Y");
-                });
-                ui.label("Mesh:");
-                ui.group(|ui| {
-                    ui.label("Descriptions:");
+            ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.heading("Left Panel");
                     ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("X:");
-                        ui.text_edit_singleline(&mut self.mesh.x_desc);
+                    // Chart
+                    ui.collapsing(WidgetText::from("Chart").heading(), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Size:");
+                            ui.add(DragValue::new(&mut self.config.size.0).speed(1))
+                                .on_hover_text("X");
+                            ui.add(DragValue::new(&mut self.config.size.1).speed(1))
+                                .on_hover_text("Y");
+                        });
+                        ui.group(|ui| {
+                            ui.label("Bounds:");
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label("Mass:");
+                                ui.add(
+                                    DragValue::new(&mut self.config.bounds.x.start)
+                                        .clamp_range(0..=self.config.bounds.x.end)
+                                        .speed(1),
+                                );
+                                ui.add(
+                                    DragValue::new(&mut self.config.bounds.x.end)
+                                        .clamp_range(self.config.bounds.x.start..=u64::MAX)
+                                        .speed(1),
+                                );
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Intensity:");
+                                ui.add(
+                                    DragValue::new(&mut self.config.bounds.y.start)
+                                        .clamp_range(0..=self.config.bounds.y.end)
+                                        .speed(1),
+                                );
+                                ui.add(
+                                    DragValue::new(&mut self.config.bounds.y.end)
+                                        .clamp_range(self.config.bounds.y.start..=100)
+                                        .speed(1),
+                                );
+                            });
+                        });
+                        // ui.label("Mesh:");
+                        ui.group(|ui| {
+                            ui.label("Descriptions:");
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label("Mass:");
+                                ui.text_edit_singleline(&mut self.config.descriptions.x.text);
+                            });
+                            ui.horizontal(|ui| {
+                                ui.label("Intensity:");
+                                ui.text_edit_singleline(&mut self.config.descriptions.y.text);
+                            });
+                        });
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Y:");
-                        ui.text_edit_singleline(&mut self.mesh.y_desc);
+                    // Fonts
+                    ui.collapsing(WidgetText::from("Fonts").heading(), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label("Caption:");
+                            ui.add(
+                                DragValue::new(&mut self.config.caption.font.size)
+                                    .clamp_range(1.0..=f64::MAX)
+                                    .speed(1.0),
+                            );
+                        })
+                        .response
+                        .on_hover_text("Height in points");
+                        ui.horizontal(|ui| {
+                            ui.label("Description:");
+                            ui.add(
+                                DragValue::new(&mut self.config.descriptions.font.size)
+                                    .clamp_range(1.0..=f64::MAX)
+                                    .speed(1.0),
+                            );
+                        })
+                        .response
+                        .on_hover_text("Height in points");
+                        ui.horizontal(|ui| {
+                            ui.label("Label:");
+                            ui.add(
+                                DragValue::new(&mut self.config.labels.font.size)
+                                    .clamp_range(1.0..=f64::MAX)
+                                    .speed(1.0),
+                            );
+                        })
+                        .response
+                        .on_hover_text("Height in points");
+                        // ui.horizontal(|ui| {
+                        //     ui.label("Text:");
+                        //     ui.add(
+                        //         DragValue::new(&mut self.config.label.font.size)
+                        //             .clamp_range(1.0..=f64::MAX)
+                        //             .speed(1.0),
+                        //     );
+                        // })
+                        // .response
+                        // .on_hover_text("Height in points");
                     });
-                });
-            });
-            // Axes
-            ui.collapsing(WidgetText::from("Axes").heading(), |ui| {
-                ui.group(|ui| {
-                    ui.label("Style:");
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("Stroke width:");
-                        ui.add(
-                            DragValue::new(&mut self.stroke_width)
-                                .clamp_range(0..=u32::MAX)
-                                .speed(1),
-                        );
-                    });
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Tick mark size:");
-                    ui.add(
-                        DragValue::new(&mut self.tick_mark_size)
-                            .clamp_range(0.0..=1.0)
-                            .speed(0.0001),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Label area size:");
-                    ui.add(DragValue::new(&mut self.x_label_area_size).speed(1))
-                        .on_hover_text("X");
-                    ui.add(DragValue::new(&mut self.y_label_area_size).speed(1))
-                        .on_hover_text("Y");
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Margin:");
-                    ui.add(
-                        DragValue::new(&mut self.margin)
-                            .clamp_range(0.0..=f64::MAX)
-                            .speed(1),
-                    );
-                });
+                    // Axes
+                    ui.collapsing(WidgetText::from("Axes").heading(), |ui| {
+                        ui.group(|ui| {
+                            ui.label("Style:");
+                            ui.separator();
+                            ui.horizontal(|ui| {
+                                ui.label("Stroke width:");
+                                ui.add(
+                                    DragValue::new(&mut self.stroke_width)
+                                        .clamp_range(0..=u32::MAX)
+                                        .speed(1),
+                                );
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Tick mark size:");
+                            ui.add(
+                                DragValue::new(&mut self.tick_mark_size)
+                                    .clamp_range(0.0..=1.0)
+                                    .speed(0.0001),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Label area size:");
+                            ui.add(DragValue::new(&mut self.config.labels.x.area_size).speed(1))
+                                .on_hover_text("X");
+                            ui.add(DragValue::new(&mut self.config.labels.y.area_size).speed(1))
+                                .on_hover_text("Y");
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Margin:");
+                            ui.add(
+                                DragValue::new(&mut self.margin)
+                                    .clamp_range(0.0..=f64::MAX)
+                                    .speed(1),
+                            );
+                        });
 
-                ui.horizontal(|ui| {
-                    ui.label("Test:");
-                    ui.add(DragValue::new(&mut self.test).speed(1));
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Margin:");
-                    ui.add(
-                        DragValue::new(&mut self.margin1)
-                            .clamp_range(0..=u32::MAX)
-                            .speed(1),
-                    );
-                });
-            });
-            // Bounds
-            ui.collapsing(WidgetText::from("Bounds").heading(), |ui| {
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Mass:");
-                    ui.add(
-                        DragValue::new(&mut self.bounds.x.start)
-                            .clamp_range(0..=self.bounds.x.end)
-                            .speed(1),
-                    );
-                    ui.add(
-                        DragValue::new(&mut self.bounds.x.end)
-                            .clamp_range(self.bounds.x.start..=u64::MAX)
-                            .speed(1),
-                    );
-                });
-                ui.horizontal(|ui| {
-                    ui.label("Intensity:");
-                    ui.add(
-                        DragValue::new(&mut self.bounds.y.start)
-                            .clamp_range(0..=self.bounds.y.end)
-                            .speed(1),
-                    );
-                    ui.add(
-                        DragValue::new(&mut self.bounds.y.end)
-                            .clamp_range(self.bounds.y.start..=100)
-                            .speed(1),
-                    );
-                });
-            });
-            ui.collapsing(WidgetText::from("Visual").heading(), |ui| {
-                ui.separator();
-                ui.heading("Plot");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Width:");
-                    ui.add(
-                        DragValue::new(&mut self.visuals.width)
-                            .clamp_range(0.0..=f32::MAX)
-                            .speed(1),
-                    );
-                });
-                ui.separator();
-                ui.heading("Chart");
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label("Width:");
-                    ui.add(
-                        DragValue::new(&mut self.visuals.chart.width)
-                            .clamp_range(0.0..=f64::MAX)
-                            .speed(0.01),
-                    );
-                });
-                ui.separator();
-                ui.heading("Axes");
-                ui.separator();
-                ui.group(|ui| {
-                    ui.label("Unlabeled:");
-                    ui.horizontal(|ui| {
-                        ui.label("Step:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.x.unlabeled.step)
-                                .clamp_range(1..=usize::MAX)
-                                .speed(1),
-                        );
+                        ui.horizontal(|ui| {
+                            ui.label("Test:");
+                            ui.add(DragValue::new(&mut self.test).speed(1));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Margin:");
+                            ui.add(
+                                DragValue::new(&mut self.margin1)
+                                    .clamp_range(0..=u32::MAX)
+                                    .speed(1),
+                            );
+                        });
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Height:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.x.unlabeled.height)
-                                .clamp_range(0.0..=f64::MAX)
-                                .speed(1.0),
-                        );
+                    // Labels
+                    ui.collapsing(WidgetText::from("Labels").heading(), |ui| {
+                        self.labels.retain_mut(|label| {
+                            ui.horizontal(|ui| {
+                                ui.label("Label:");
+                                let width = 4.0 * ui.text_style_height(&TextStyle::Body);
+                                TextEdit::singleline(&mut label.text)
+                                    .desired_width(width)
+                                    .show(ui);
+                                ui.add(DragValue::new(&mut label.coordinates.x).speed(1))
+                                    .on_hover_text("X")
+                                    .context_menu(|ui| {
+                                        if ui.button("Center").clicked() {
+                                            label.coordinates.x = self.config.bounds.x.center();
+                                            ui.close_menu();
+                                        }
+                                    });
+                                ui.add(DragValue::new(&mut label.coordinates.y).speed(1))
+                                    .on_hover_text("Y")
+                                    .context_menu(|ui| {
+                                        if ui.button("Center").clicked() {
+                                            // label.coordinates.y = self.image.bounds.y.center();
+                                            ui.close_menu();
+                                        }
+                                    });
+                                ui.toggle_value(&mut label.bold, "bold");
+                                !ui.button(RichText::new("-").monospace()).clicked()
+                            })
+                            .inner
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("-").monospace()).clicked() {
+                                self.labels.clear();
+                            }
+                            if ui.button(RichText::new("+").monospace()).clicked() {
+                                self.labels.push(default());
+                            }
+                        });
                     });
-                    ui.horizontal(|ui| {
-                        ui.label("Width:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.x.unlabeled.width)
-                                .clamp_range(0.0..=f64::MAX)
-                                .speed(1.0),
-                        );
+                    // Points
+                    ui.collapsing(WidgetText::from("Points").heading(), |ui| {
+                        self.points.retain_mut(|point| {
+                            ui.horizontal(|ui| {
+                                ui.label("Point:");
+                                ui.add(DragValue::new(&mut point.coordinates.x).speed(1))
+                                    .on_hover_text("X")
+                                    .context_menu(|ui| {
+                                        if ui.button("Center").clicked() {
+                                            point.coordinates.x = self.config.bounds.x.center();
+                                            ui.close_menu();
+                                        }
+                                    });
+                                ui.add(DragValue::new(&mut point.coordinates.y).speed(1))
+                                    .on_hover_text("Y")
+                                    .context_menu(|ui| {
+                                        if ui.button("Center").clicked() {
+                                            // point.coordinates.y = self.image.bounds.y.center();
+                                            ui.close_menu();
+                                        }
+                                    });
+                                ui.toggle_value(&mut point.filled, "filled");
+                                ui.add(DragValue::new(&mut point.size).speed(1))
+                                    .on_hover_text("Radius");
+                                ui.color_edit_button_srgba(&mut point.color)
+                                    .on_hover_text("Color");
+                                !ui.button(RichText::new("-").monospace()).clicked()
+                            })
+                            .inner
+                        });
+                        ui.horizontal(|ui| {
+                            if ui.button(RichText::new("+").monospace()).clicked() {
+                                self.points.push(default());
+                            }
+                        });
                     });
+                    // ui.collapsing(WidgetText::from("Visual").heading(), |ui| {
+                    //     ui.separator();
+                    //     ui.heading("Plot");
+                    //     ui.separator();
+                    //     ui.horizontal(|ui| {
+                    //         ui.label("Width:");
+                    //         ui.add(
+                    //             DragValue::new(&mut self.visuals.width)
+                    //                 .clamp_range(0.0..=f32::MAX)
+                    //                 .speed(1),
+                    //         );
+                    //     });
+                    //     ui.separator();
+                    //     ui.heading("Chart");
+                    //     ui.separator();
+                    //     ui.horizontal(|ui| {
+                    //         ui.label("Width:");
+                    //         ui.add(
+                    //             DragValue::new(&mut self.visuals.chart.width)
+                    //                 .clamp_range(0.0..=f64::MAX)
+                    //                 .speed(0.01),
+                    //         );
+                    //     });
+                    //     ui.separator();
+                    //     ui.heading("Axes");
+                    //     ui.separator();
+                    //     ui.group(|ui| {
+                    //         ui.label("Unlabeled:");
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Step:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.x.unlabeled.step)
+                    //                     .clamp_range(1..=usize::MAX)
+                    //                     .speed(1),
+                    //             );
+                    //         });
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Height:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.x.unlabeled.height)
+                    //                     .clamp_range(0.0..=f64::MAX)
+                    //                     .speed(1.0),
+                    //             );
+                    //         });
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Width:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.x.unlabeled.width)
+                    //                     .clamp_range(0.0..=f64::MAX)
+                    //                     .speed(1.0),
+                    //             );
+                    //         });
+                    //     });
+                    //     ui.group(|ui| {
+                    //         ui.label("Labeled:");
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Step:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.x.labeled.step)
+                    //                     .clamp_range(1..=usize::MAX)
+                    //                     .speed(1),
+                    //             );
+                    //         });
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Height:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.x.labeled.height)
+                    //                     .clamp_range(0.0..=f64::MAX)
+                    //                     .speed(1.0),
+                    //             );
+                    //         });
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Width:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.x.labeled.width)
+                    //                     .clamp_range(0.0..=f64::MAX)
+                    //                     .speed(1.0),
+                    //             );
+                    //         });
+                    //         ui.label("Font:");
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Size:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.x.labeled.font_size)
+                    //                     .clamp_range(1.0..=f64::MAX)
+                    //                     .speed(1.0),
+                    //             );
+                    //         })
+                    //         .response
+                    //         .on_hover_text("Height in points");
+                    //     });
+                    //     ui.group(|ui| {
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Step:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.y.step)
+                    //                     .clamp_range(1..=usize::MAX)
+                    //                     .speed(1),
+                    //             );
+                    //         });
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Height:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.y.height)
+                    //                     .clamp_range(0.0..=f64::MAX)
+                    //                     .speed(1.0),
+                    //             );
+                    //         });
+                    //         ui.horizontal(|ui| {
+                    //             ui.label("Width:");
+                    //             ui.add(
+                    //                 DragValue::new(&mut self.visuals.y.width)
+                    //                     .clamp_range(0.0..=f64::MAX)
+                    //                     .speed(1.0),
+                    //             );
+                    //         });
+                    //     });
+                    //     // ui.color_edit_button_srgba(&mut self.visuals.division.color);
+                    // });
                 });
-                ui.group(|ui| {
-                    ui.label("Labeled:");
-                    ui.horizontal(|ui| {
-                        ui.label("Step:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.x.labeled.step)
-                                .clamp_range(1..=usize::MAX)
-                                .speed(1),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Height:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.x.labeled.height)
-                                .clamp_range(0.0..=f64::MAX)
-                                .speed(1.0),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Width:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.x.labeled.width)
-                                .clamp_range(0.0..=f64::MAX)
-                                .speed(1.0),
-                        );
-                    });
-                    ui.label("Font:");
-                    ui.horizontal(|ui| {
-                        ui.label("Size:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.x.labeled.font_size)
-                                .clamp_range(1.0..=f64::MAX)
-                                .speed(1.0),
-                        );
-                    })
-                    .response
-                    .on_hover_text("Height in points");
-                });
-                ui.group(|ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Step:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.y.step)
-                                .clamp_range(1..=usize::MAX)
-                                .speed(1),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Height:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.y.height)
-                                .clamp_range(0.0..=f64::MAX)
-                                .speed(1.0),
-                        );
-                    });
-                    ui.horizontal(|ui| {
-                        ui.label("Width:");
-                        ui.add(
-                            DragValue::new(&mut self.visuals.y.width)
-                                .clamp_range(0.0..=f64::MAX)
-                                .speed(1.0),
-                        );
-                    });
-                });
-                // ui.color_edit_button_srgba(&mut self.visuals.division.color);
-            });
-            // Labels
-            ui.collapsing(WidgetText::from("Labels").heading(), |ui| {
-                self.labels.retain_mut(|label| {
-                    ui.horizontal(|ui| {
-                        ui.label("Label:");
-                        let width = 4.0 * ui.text_style_height(&TextStyle::Body);
-                        TextEdit::singleline(&mut label.text)
-                            .desired_width(width)
-                            .show(ui);
-                        ui.add(DragValue::new(&mut label.coordinates.x).speed(1))
-                            .on_hover_text("X")
-                            .context_menu(|ui| {
-                                if ui.button("Center").clicked() {
-                                    label.coordinates.x = self.bounds.x.center();
-                                    ui.close_menu();
-                                }
-                            });
-                        ui.add(DragValue::new(&mut label.coordinates.y).speed(1))
-                            .on_hover_text("Y")
-                            .context_menu(|ui| {
-                                if ui.button("Center").clicked() {
-                                    // label.coordinates.y = self.bounds.y.center();
-                                    ui.close_menu();
-                                }
-                            });
-                        ui.toggle_value(&mut label.bold, "bold");
-                        !ui.button(RichText::new("-").monospace()).clicked()
-                    })
-                    .inner
-                });
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new("-").monospace()).clicked() {
-                        self.labels.clear();
-                    }
-                    if ui.button(RichText::new("+").monospace()).clicked() {
-                        self.labels.push(default());
-                    }
-                });
-            });
-            // Points
-            ui.collapsing(WidgetText::from("Points").heading(), |ui| {
-                self.points.retain_mut(|point| {
-                    ui.horizontal(|ui| {
-                        ui.label("Point:");
-                        ui.add(DragValue::new(&mut point.coordinates.x).speed(1))
-                            .on_hover_text("X")
-                            .context_menu(|ui| {
-                                if ui.button("Center").clicked() {
-                                    point.coordinates.x = self.bounds.x.center();
-                                    ui.close_menu();
-                                }
-                            });
-                        ui.add(DragValue::new(&mut point.coordinates.y).speed(1))
-                            .on_hover_text("Y")
-                            .context_menu(|ui| {
-                                if ui.button("Center").clicked() {
-                                    // point.coordinates.y = self.bounds.y.center();
-                                    ui.close_menu();
-                                }
-                            });
-                        ui.toggle_value(&mut point.filled, "filled");
-                        ui.add(DragValue::new(&mut point.size).speed(1))
-                            .on_hover_text("Radius");
-                        ui.color_edit_button_srgba(&mut point.color)
-                            .on_hover_text("Color");
-                        !ui.button(RichText::new("-").monospace()).clicked()
-                    })
-                    .inner
-                });
-                ui.horizontal(|ui| {
-                    if ui.button(RichText::new("+").monospace()).clicked() {
-                        self.points.push(default());
-                    }
-                });
-            });
         });
     }
 
@@ -636,7 +632,7 @@ impl App {
                 ui.toggle_value(&mut self.errors.show, "⚠ Errors");
                 if ui.button("Save Plot").clicked() {
                     self.save_plot = true;
-                    std::fs::write("output.svg", self.svg(ui).unwrap()).unwrap();
+                    // std::fs::write("output.svg", self.svg(ui).unwrap()).unwrap();
                 }
             });
         });
@@ -695,294 +691,373 @@ impl App {
 }
 
 impl App {
-    fn svg(&mut self, ui: &mut Ui) -> Result<Vec<u8>> {
-        // let mut buf = String::new();
-        let mut buf = Vec::new();
-        {
-            // let size = (1920, 1080);
-            let drawing_area =
-                BitMapBackend::with_buffer(&mut buf, self.svg.size).into_drawing_area();
-            // let drawing_area = SVGBackend::with_string(&mut buf, self.svg.size).into_drawing_area();
-            drawing_area.fill(&WHITE)?;
-            // Labels
-            for label in &*self.labels {
-                drawing_area.draw_text(
-                    &label.text,
-                    &("Arial", self.visuals.x.labeled.font_size)
-                        .into_text_style(&self.svg.size)
-                        .color(&BLACK),
-                    (label.coordinates.x as _, label.coordinates.y as _),
-                )?;
-            }
-            // Points
-            for point in &*self.points {
-                drawing_area.draw(&Circle::new(
-                    (point.coordinates.x as _, point.coordinates.y as _),
-                    point.size,
-                    ShapeStyle {
-                        color: RGBAColor(
-                            point.color.r(),
-                            point.color.g(),
-                            point.color.b(),
-                            point.color.a() as f64 / u8::MAX as f64,
-                        ),
-                        filled: point.filled,
-                        stroke_width: default(),
-                    },
-                ))?;
-                // drawing_area.draw(&Circle::new(
-                //     (point.coordinates.x, point.coordinates.y),
-                //     point.radius,
-                //     original_style,
-                // ));
-            }
-            let mut chart = ChartBuilder::on(&drawing_area)
-                .x_label_area_size(self.x_label_area_size)
-                .y_label_area_size(self.y_label_area_size)
-                .margin(self.margin)
-                .caption("Header", ("Ubuntu", 50.0))
-                .build_cartesian_2d(
-                    self.bounds.x.clone().into_segmented(),
-                    self.bounds.y.start as _..self.bounds.y.end as f64,
-                )?;
-            chart
-                .configure_mesh()
-                .disable_mesh()
-                .x_desc(&self.mesh.x_desc)
-                .y_desc(&self.mesh.y_desc)
-                .x_labels(100)
-                .y_label_offset(self.test)
-                .set_all_tick_mark_size(RelativeSize::Width(self.tick_mark_size))
-                .axis_style(BLACK.stroke_width(self.stroke_width))
-                .axis_desc_style(("sans-serif", 20))
-                .draw()?;
-            // chart.configure_series_labels().draw()?;
-
-            // Parsed
-            let parsed = &self.parsed[&0];
-            // Bounded
-            let peaks = ui.memory_mut(|memory| {
-                memory
-                    .caches
-                    .cache::<Bounded>()
-                    .get((&parsed.peaks, &self.bounds))
-            });
-            // Normalized
-            let peaks = ui.memory_mut(|memory| memory.caches.cache::<Normalized>().get(&peaks));
-            chart.draw_series(
-                Histogram::vertical(&chart)
-                    .style(BLACK.filled())
-                    .margin(self.margin1)
-                    // .data(
-                    //     data.iter()
-                    //         .enumerate()
-                    //         .map(|(index, &x)| (index as u64, x as f64)),
-                    // ),
-                    // .data(data.iter().map(|(&x, &y)| (x, y))),
-                    .data(peaks),
-            )?;
-            // To avoid the IO failure being ignored silently, we manually call the present function
-            drawing_area.present().expect("Unable to write result to file, please make sure 'plotters-doc-data' dir exists under current dir");
-        }
-        Ok(buf)
+    fn rgb(&mut self, ui: &mut Ui) -> anyhow::Result<RetainedImage> {
+        let mut buf =
+            vec![0; RGBPixel::PIXEL_SIZE * (self.config.size.0 * self.config.size.1) as usize];
+        self.draw(
+            ui.ctx(),
+            BitMapBackend::with_buffer(&mut buf, self.config.size),
+        )?;
+        Ok(RetainedImage::from_color_image(
+            "rgb",
+            ColorImage::from_rgb([self.config.size.0 as _, self.config.size.1 as _], &buf),
+        ))
     }
 
-    // Bar Chart
-    fn bar_chart(&self, ui: &mut Ui) -> BarChart {
+    fn svg(&mut self, ui: &mut Ui) -> Result<RetainedImage> {
+        let mut buf = String::new();
+        self.draw(
+            ui.ctx(),
+            SVGBackend::with_string(&mut buf, self.config.size),
+        )?;
+        Ok(RetainedImage::from_svg_str("svg", &buf).map_err(Error::msg)?)
+    }
+
+    fn draw<T>(&self, context: &Context, drawing_backend: T) -> Result<()>
+    where
+        T: DrawingBackend,
+        <T as DrawingBackend>::ErrorType: 'static,
+    {
+        let drawing_area = drawing_backend.into_drawing_area();
+        drawing_area.fill(&WHITE)?;
+        // Labels
+        for label in &*self.labels {
+            drawing_area.draw_text(
+                &label.text,
+                &self
+                    .config
+                    .chart
+                    .labels
+                    .font
+                    .style()
+                    .into_text_style(&self.config.chart.size)
+                    .color(&BLACK),
+                (label.coordinates.x as _, label.coordinates.y as _),
+            )?;
+        }
+        // Points
+        for point in &*self.points {
+            drawing_area.draw(&Circle::new(
+                (point.coordinates.x as _, point.coordinates.y as _),
+                point.size,
+                ShapeStyle {
+                    color: RGBAColor(
+                        point.color.r(),
+                        point.color.g(),
+                        point.color.b(),
+                        point.color.a() as f64 / u8::MAX as f64,
+                    ),
+                    filled: point.filled,
+                    stroke_width: default(),
+                },
+            ))?;
+            // drawing_area.draw(&Circle::new(
+            //     (point.coordinates.x, point.coordinates.y),
+            //     point.radius,
+            //     original_style,
+            // ));
+        }
+        let mut chart = ChartBuilder::on(&drawing_area)
+            .x_label_area_size(self.config.chart.axes.labels.x.area_size)
+            .y_label_area_size(self.config.chart.axes.labels.y.area_size)
+            .margin(self.config.chart.margin)
+            .caption(
+                &self.config.chart.caption,
+                self.config.chart.caption.font.style(),
+            )
+            .build_cartesian_2d(
+                self.config.bounds.x.range().into_segmented(),
+                self.config.bounds.y.start as _..self.config.bounds.y.end as f64,
+            )?;
+        chart
+            .configure_mesh()
+            .disable_mesh()
+            .x_desc(&self.config.chart.axes.descriptions.x)
+            .y_desc(&self.config.chart.axes.descriptions.y)
+            .axis_desc_style(self.config.chart.axes.descriptions.font.style())
+            .label_style(self.config.chart.axes.labels.font.style())
+            .x_labels(100)
+            .set_all_tick_mark_size(RelativeSize::Width(self.tick_mark_size))
+            .axis_style(BLACK.stroke_width(self.config.chart.axes.stroke_width))
+            .draw()?;
+        // chart.configure_series_labels().draw()?;
+
         // Parsed
         let parsed = &self.parsed[&0];
         // Bounded
-        let peaks = ui.memory_mut(|memory| {
+        let peaks = context.memory_mut(|memory| {
             memory
                 .caches
                 .cache::<Bounded>()
-                .get((&parsed.peaks, &self.bounds))
+                .get((&parsed.peaks, &self.config.bounds))
         });
         // Normalized
-        let peaks = ui.memory_mut(|memory| memory.caches.cache::<Normalized>().get(&peaks));
-        // Bar chart
-        let bars = peaks
-            .iter()
-            .map(|(&mass, &intensity)| Bar::new(mass as _, intensity as _).fill(COLOR))
-            .collect();
-        BarChart::new(bars)
-            .color(COLOR)
-            .width(self.visuals.chart.width)
+        let peaks =
+            context.memory_mut(|memory| memory.caches.cache::<Normalized>().get((&peaks, true)));
+        chart.draw_series(
+            Histogram::vertical(&chart)
+                .style(BLACK.filled())
+                .margin(self.margin1)
+                // .data(
+                //     data.iter()
+                //         .enumerate()
+                //         .map(|(index, &x)| (index as u64, x as f64)),
+                // ),
+                // .data(data.iter().map(|(&x, &y)| (x, y))),
+                .data(peaks),
+        )?;
+        // To avoid the IO failure being ignored silently, we manually call the present function
+        drawing_area.present().expect("Unable to write result to file, please make sure 'plotters-doc-data' dir exists under current dir");
+        Ok(())
     }
+
+    // fn svg(&mut self, ui: &mut Ui) -> Result<Vec<u8>> {
+    //     // let mut buf = String::new();
+    //     let mut buf = vec![0; RGBPixel::PIXEL_SIZE * (self.svg.size.0 * self.svg.size.1) as usize];
+    //     {
+    //         let drawing_area =
+    //             BitMapBackend::with_buffer(&mut buf, self.svg.size).into_drawing_area();
+    //         // let drawing_area = SVGBackend::with_string(&mut buf, self.svg.size).into_drawing_area();
+    //         drawing_area.fill(&WHITE)?;
+    //         // Labels
+    //         for label in &*self.labels {
+    //             drawing_area.draw_text(
+    //                 &label.text,
+    //                 &("Arial", self.visuals.x.labeled.font_size)
+    //                     .into_text_style(&self.svg.size)
+    //                     .color(&BLACK),
+    //                 (label.coordinates.x as _, label.coordinates.y as _),
+    //             )?;
+    //         }
+    //         // Points
+    //         for point in &*self.points {
+    //             drawing_area.draw(&Circle::new(
+    //                 (point.coordinates.x as _, point.coordinates.y as _),
+    //                 point.size,
+    //                 ShapeStyle {
+    //                     color: RGBAColor(
+    //                         point.color.r(),
+    //                         point.color.g(),
+    //                         point.color.b(),
+    //                         point.color.a() as f64 / u8::MAX as f64,
+    //                     ),
+    //                     filled: point.filled,
+    //                     stroke_width: default(),
+    //                 },
+    //             ))?;
+    //             // drawing_area.draw(&Circle::new(
+    //             //     (point.coordinates.x, point.coordinates.y),
+    //             //     point.radius,
+    //             //     original_style,
+    //             // ));
+    //         }
+    //         let mut chart = ChartBuilder::on(&drawing_area)
+    //             .x_label_area_size(self.x_label_area_size)
+    //             .y_label_area_size(self.y_label_area_size)
+    //             .margin(self.margin)
+    //             .caption("Header", ("Ubuntu", 50.0))
+    //             .build_cartesian_2d(
+    //                 self.image.bounds.x.clone().into_segmented(),
+    //                 self.image.bounds.y.start as _..self.image.bounds.y.end as f64,
+    //             )?;
+    //         chart
+    //             .configure_mesh()
+    //             .disable_mesh()
+    //             .x_desc(&self.mesh.x_desc)
+    //             .y_desc(&self.mesh.y_desc)
+    //             .x_labels(100)
+    //             .y_label_offset(self.test)
+    //             .set_all_tick_mark_size(RelativeSize::Width(self.tick_mark_size))
+    //             .axis_style(BLACK.stroke_width(self.stroke_width))
+    //             .axis_desc_style(("sans-serif", 20))
+    //             .draw()?;
+    //         // chart.configure_series_labels().draw()?;
+    //         // Parsed
+    //         let parsed = &self.parsed[&0];
+    //         // Bounded
+    //         let peaks = ui.memory_mut(|memory| {
+    //             memory
+    //                 .caches
+    //                 .cache::<Bounded>()
+    //                 .get((&parsed.peaks, &self.image.bounds))
+    //         });
+    //         // Normalized
+    //         let peaks =
+    //             ui.memory_mut(|memory| memory.caches.cache::<Normalized>().get((&peaks, true)));
+    //         chart.draw_series(
+    //             Histogram::vertical(&chart)
+    //                 .style(BLACK.filled())
+    //                 .margin(self.margin1)
+    //                 // .data(
+    //                 //     data.iter()
+    //                 //         .enumerate()
+    //                 //         .map(|(index, &x)| (index as u64, x as f64)),
+    //                 // ),
+    //                 // .data(data.iter().map(|(&x, &y)| (x, y))),
+    //                 .data(peaks),
+    //         )?;
+    //         // To avoid the IO failure being ignored silently, we manually call the present function
+    //         drawing_area.present().expect("Unable to write result to file, please make sure 'plotters-doc-data' dir exists under current dir");
+    //     }
+    //     Ok(buf)
+    // }
+
+    // Bar Chart
+    // fn bar_chart(&self, ui: &mut Ui) -> BarChart {
+    //     // Parsed
+    //     let parsed = &self.parsed[&0];
+    //     // Bounded
+    //     let peaks = ui.memory_mut(|memory| {
+    //         memory
+    //             .caches
+    //             .cache::<Bounded>()
+    //             .get((&parsed.peaks, &self.config.bounds))
+    //     });
+    //     // Normalized
+    //     let peaks = ui.memory_mut(|memory| memory.caches.cache::<Normalized>().get((&peaks, true)));
+    //     // Bar chart
+    //     let bars = peaks
+    //         .iter()
+    //         .map(|(&mass, &intensity)| Bar::new(mass as _, intensity as _).fill(COLOR))
+    //         .collect();
+    //     BarChart::new(bars)
+    //         .color(COLOR)
+    //         .width(self.visuals.chart.width)
+    // }
 
     // Labels
-    fn labels(&self, texts: &mut Vec<Text>) {
-        for label in &*self.labels {
-            texts.push(
-                Text::new(
-                    PlotPoint::new(label.coordinates.x, label.coordinates.y),
-                    RichText::new(&label.text).font(FontId::new(
-                        self.visuals.x.labeled.font_size,
-                        FontFamily::Name(
-                            label.bold.then_some("Arial Bold").unwrap_or("Arial").into(),
-                        ),
-                    )),
-                )
-                .anchor(Align2::CENTER_TOP)
-                .color(COLOR),
-            );
-        }
-    }
+    // fn labels(&self, texts: &mut Vec<Text>) {
+    //     for label in &*self.labels {
+    //         texts.push(
+    //             Text::new(
+    //                 PlotPoint::new(label.coordinates.x, label.coordinates.y),
+    //                 RichText::new(&label.text).font(FontId::new(
+    //                     self.visuals.x.labeled.font_size,
+    //                     FontFamily::Name(
+    //                         label.bold.then_some("Arial Bold").unwrap_or("Arial").into(),
+    //                     ),
+    //                 )),
+    //             )
+    //             .anchor(Align2::CENTER_TOP)
+    //             .color(COLOR),
+    //         );
+    //     }
+    // }
 
     // Points
-    fn points(&self, points: &mut Vec<Points>) {
-        for point in &*self.points {
-            points.push(
-                Points::new(vec![[point.coordinates.x, point.coordinates.y]])
-                    .color(point.color)
-                    .filled(point.filled)
-                    .radius(point.size),
-            );
-        }
-    }
+    // fn points(&self, points: &mut Vec<Points>) {
+    //     for point in &*self.points {
+    //         points.push(
+    //             Points::new(vec![[point.coordinates.x, point.coordinates.y]])
+    //                 .color(point.color)
+    //                 .filled(point.filled)
+    //                 .radius(point.size),
+    //         );
+    //     }
+    // }
 
-    fn axes(&self, lines: &mut Vec<Line>, texts: &mut Vec<Text>) {
-        self.x(lines, texts);
-        self.y(lines, texts);
-    }
+    // fn axes(&self, lines: &mut Vec<Line>, texts: &mut Vec<Text>) {
+    //     self.x(lines, texts);
+    //     self.y(lines, texts);
+    // }
 
-    fn x(&self, lines: &mut Vec<Line>, texts: &mut Vec<Text>) {
-        let y = self.bounds.y.start as _;
-        lines.push(
-            DLine::new(vec![
-                [self.bounds.x.start as _, y],
-                [self.bounds.x.end as _, y],
-            ])
-            .color(COLOR)
-            .name("x")
-            .width(self.visuals.x.labeled.width)
-            .into(),
-        );
-        for index in self.bounds.x().step_by(self.visuals.x.unlabeled.step as _) {
-            let x = index as _;
-            lines.push(
-                DLine::new(vec![[x, y], [x, y - self.visuals.x.unlabeled.height]])
-                    .color(COLOR)
-                    .width(self.visuals.x.unlabeled.width)
-                    .into(),
-            );
-        }
-        for index in self
-            .bounds
-            .x()
-            .filter(|x| x % self.visuals.x.labeled.step == 0)
-        {
-            let x = index as _;
-            lines.push(
-                DLine::new(vec![[x, y], [x, y - self.visuals.x.labeled.height]])
-                    .color(COLOR)
-                    .width(self.visuals.x.labeled.width)
-                    .into(),
-            );
-            texts.push(
-                Text::new(
-                    PlotPoint::new(x, y - self.visuals.x.labeled.height),
-                    RichText::new(index.to_string()).font(FontId::new(
-                        self.visuals.x.labeled.font_size,
-                        FontFamily::Name("Arial".into()),
-                    )),
-                )
-                .anchor(Align2::CENTER_TOP)
-                .color(COLOR),
-            );
-        }
-    }
+    // fn x(&self, lines: &mut Vec<Line>, texts: &mut Vec<Text>) {
+    //     let y = self.config.bounds.y.start as _;
+    //     lines.push(
+    //         DLine::new(vec![
+    //             [self.config.bounds.x.start as _, y],
+    //             [self.config.bounds.x.end as _, y],
+    //         ])
+    //         .color(COLOR)
+    //         .name("x")
+    //         .width(self.visuals.x.labeled.width)
+    //         .into(),
+    //     );
+    //     for index in self
+    //         .config
+    //         .bounds
+    //         .x
+    //         .range_inclusive()
+    //         .step_by(self.visuals.x.unlabeled.step as _)
+    //     {
+    //         let x = index as _;
+    //         lines.push(
+    //             DLine::new(vec![[x, y], [x, y - self.visuals.x.unlabeled.height]])
+    //                 .color(COLOR)
+    //                 .width(self.visuals.x.unlabeled.width)
+    //                 .into(),
+    //         );
+    //     }
+    //     for index in self
+    //         .config
+    //         .bounds
+    //         .x
+    //         .range_inclusive()
+    //         .filter(|x| x % self.visuals.x.labeled.step == 0)
+    //     {
+    //         let x = index as _;
+    //         lines.push(
+    //             DLine::new(vec![[x, y], [x, y - self.visuals.x.labeled.height]])
+    //                 .color(COLOR)
+    //                 .width(self.visuals.x.labeled.width)
+    //                 .into(),
+    //         );
+    //         texts.push(
+    //             Text::new(
+    //                 PlotPoint::new(x, y - self.visuals.x.labeled.height),
+    //                 RichText::new(index.to_string()).font(FontId::new(
+    //                     self.visuals.x.labeled.font_size,
+    //                     FontFamily::Name("Arial".into()),
+    //                 )),
+    //             )
+    //             .anchor(Align2::CENTER_TOP)
+    //             .color(COLOR),
+    //         );
+    //     }
+    // }
 
-    fn y(&self, lines: &mut Vec<Line>, texts: &mut Vec<Text>) {
-        let x = self.bounds.x.start as _;
-        lines.push(
-            DLine::new(vec![
-                [x, self.bounds.y.start as _],
-                [x, self.bounds.y.end as _],
-            ])
-            .color(COLOR)
-            .name("y")
-            .width(self.visuals.y.width)
-            .into(),
-        );
-        for index in self.bounds.y().filter(|y| y % self.visuals.y.step == 0) {
-            let y = index as _;
-            lines.push(
-                DLine::new(vec![[x, y], [x - self.visuals.y.height, y]])
-                    .color(COLOR)
-                    .width(self.visuals.y.width)
-                    .into(),
-            );
-            texts.push(
-                Text::new(
-                    PlotPoint::new(x - self.visuals.y.height - 1.0, y),
-                    RichText::new(index.to_string()).font(FontId::new(
-                        self.visuals.x.labeled.font_size,
-                        FontFamily::Name("Arial".into()),
-                    )),
-                )
-                .anchor(Align2::RIGHT_CENTER)
-                .color(COLOR),
-            );
-        }
-    }
+    // fn y(&self, lines: &mut Vec<Line>, texts: &mut Vec<Text>) {
+    //     let x = self.config.bounds.x.start as _;
+    //     lines.push(
+    //         DLine::new(vec![
+    //             [x, self.config.bounds.y.start as _],
+    //             [x, self.config.bounds.y.end as _],
+    //         ])
+    //         .color(COLOR)
+    //         .name("y")
+    //         .width(self.visuals.y.width)
+    //         .into(),
+    //     );
+    //     for index in self
+    //         .config
+    //         .bounds
+    //         .y
+    //         .range_inclusive()
+    //         .filter(|y| y % self.visuals.y.step == 0)
+    //     {
+    //         let y = index as _;
+    //         lines.push(
+    //             DLine::new(vec![[x, y], [x - self.visuals.y.height, y]])
+    //                 .color(COLOR)
+    //                 .width(self.visuals.y.width)
+    //                 .into(),
+    //         );
+    //         texts.push(
+    //             Text::new(
+    //                 PlotPoint::new(x - self.visuals.y.height - 1.0, y),
+    //                 RichText::new(index.to_string()).font(FontId::new(
+    //                     self.visuals.x.labeled.font_size,
+    //                     FontFamily::Name("Arial".into()),
+    //                 )),
+    //             )
+    //             .anchor(Align2::RIGHT_CENTER)
+    //             .color(COLOR),
+    //         );
+    //     }
+    // }
 }
 
 impl eframe::App for App {
-    #[allow(unsafe_code)]
-    fn post_rendering(&mut self, window_size_px: [u32; 2], frame: &Frame) {
-        if !self.save_plot {
-            return;
-        }
-        error!(?window_size_px);
-
-        self.save_plot = false;
-        if let Some(context) = frame.gl() {
-            let [window_width, window_height] = window_size_px;
-
-            // We needed the relative values here, because we need to have them
-            // in relation to the screen_size_px.
-            // Calculating with absolut px values does not always work. Using
-            // relative values, we have a working solution for all cases
-            // let x = self.plot_size[0] * window_width as f32;
-            // let y = self.plot_size[1] * window_height as f32;
-            // let width = self.plot_size[2] * window_width as f32;
-            // let height = self.plot_size[3] * window_height as f32;
-            let x = 0.0;
-            let y = 0.0;
-            let width = window_width as f32;
-            let height = window_height as f32;
-            error!(?x, ?y, ?width, ?height);
-
-            let mut buf = vec![0u8; width as usize * height as usize * 4];
-            let pixels = PixelPackData::Slice(&mut buf[..]);
-            unsafe {
-                context.read_pixels(
-                    x as i32,
-                    y as i32,
-                    width as i32,
-                    height as i32,
-                    RGBA,
-                    UNSIGNED_BYTE,
-                    pixels,
-                );
-            }
-
-            // Flip vertically:
-            let mut rows: Vec<Vec<u8>> = buf
-                .chunks(width as usize * 4)
-                .into_iter()
-                .map(|chunk| chunk.to_vec())
-                .collect();
-            rows.reverse();
-            let buf: Vec<u8> = rows.into_iter().flatten().collect();
-            self.plot_to_save = Some(ColorImage::from_rgba_unmultiplied(
-                [width as _, height as _],
-                &buf[..],
-            ));
-        }
-    }
-
     /// Called by the frame work to save state before shutdown.
     fn save(&mut self, storage: &mut dyn Storage) {
         set_value(storage, APP_KEY, self);
@@ -997,6 +1072,208 @@ impl eframe::App for App {
         self.drag_and_drop_files(ctx);
         self.errors(ctx);
         self.files(ctx);
+    }
+}
+
+mod config {
+    use eframe::emath::Numeric;
+    use serde::{Deserialize, Serialize};
+    use std::{
+        default::default,
+        ops::{Range, RangeInclusive},
+    };
+
+    // Config
+    #[derive(Clone, Default, Deserialize, Serialize)]
+    pub(super) struct Config {
+        // pub(super) tick_mark_size: f64,
+        //
+        pub(super) chart: Chart,
+    }
+
+    // impl Default for Config {
+    //     fn default() -> Self {
+    //         Self {
+    //             bounds: default(),
+    //             chart: default(),
+    //             size: (1920, 1080),
+    //         }
+    //     }
+    // }
+
+    /// Chart
+    #[derive(Clone, Default, Deserialize, Serialize)]
+    pub(super) struct Chart {
+        pub(super) axes: Axes,
+        pub(super) bounds: Bounds,
+        pub(super) caption: Caption,
+        pub(super) margin: f64,
+        pub(super) size: (u32, u32),
+    }
+
+    /// Axes
+    #[derive(Clone, Deserialize, Serialize)]
+    pub(super) struct Axes {
+        pub(super) descriptions: Descriptions,
+        pub(super) labels: Labels,
+        pub(super) stroke_width: u32,
+    }
+
+    impl Default for Axes {
+        fn default() -> Self {
+            Self {
+                descriptions: default(),
+                labels: default(),
+                stroke_width: 1,
+            }
+        }
+    }
+
+    // /// Axis
+    // #[derive(Clone, Deserialize, Serialize)]
+    // pub(super) struct Axis {
+    //     pub(super) description: Description,
+    //     pub(super) labels: Labels,
+    // }
+
+    /// Bounds
+    #[derive(Clone, Debug, Deserialize, Hash, Serialize)]
+    pub(super) struct Bounds {
+        pub(super) x: Bound<u64>,
+        pub(super) y: Bound<u64>,
+    }
+
+    impl Default for Bounds {
+        fn default() -> Self {
+            Self {
+                x: Bound { start: 0, end: 100 },
+                y: Bound { start: 0, end: 100 },
+            }
+        }
+    }
+
+    /// Bound
+    #[derive(Clone, Copy, Debug, Deserialize, Hash, Serialize)]
+    pub(super) struct Bound<T> {
+        pub(super) start: T,
+        pub(super) end: T,
+    }
+
+    impl<T: Copy> Bound<T> {
+        pub(super) fn range(&self) -> Range<T> {
+            self.start..self.end
+        }
+
+        pub(super) fn range_inclusive(&self) -> RangeInclusive<T> {
+            self.start..=self.end
+        }
+    }
+
+    impl<T: Numeric> Bound<T> {
+        pub(super) fn center(&self) -> f64 {
+            self.start.to_f64() + self.end.to_f64() / 2.0
+        }
+    }
+
+    /// Caption
+    #[derive(Clone, Deserialize, Serialize)]
+    pub(super) struct Caption {
+        pub(super) font: Font,
+        pub(super) text: String,
+    }
+
+    impl AsRef<str> for Caption {
+        fn as_ref(&self) -> &str {
+            &self.text
+        }
+    }
+
+    impl Default for Caption {
+        fn default() -> Self {
+            Self {
+                font: Font {
+                    size: 32.0,
+                    ..default()
+                },
+                text: "Caption".to_owned(),
+            }
+        }
+    }
+
+    /// Descriptions
+    #[derive(Clone, Deserialize, Serialize)]
+    pub(super) struct Descriptions {
+        pub(super) font: Font,
+        pub(super) x: String,
+        pub(super) y: String,
+    }
+
+    impl Default for Descriptions {
+        fn default() -> Self {
+            Self {
+                font: Font {
+                    size: 32.0,
+                    ..default()
+                },
+                x: "m/z".to_owned(),
+                y: "Intensity %".to_owned(),
+            }
+        }
+    }
+
+    /// Font
+    #[derive(Clone, Deserialize, Serialize)]
+    pub(super) struct Font {
+        pub(super) name: String,
+        pub(super) size: f32,
+    }
+
+    impl Font {
+        pub(super) fn style(&self) -> (&str, f32) {
+            (&self.name, self.size)
+        }
+    }
+
+    impl Default for Font {
+        fn default() -> Self {
+            Self {
+                name: "Arial".to_owned(),
+                size: 16.0,
+            }
+        }
+    }
+
+    /// Labels
+    #[derive(Clone, Deserialize, Serialize)]
+    pub(super) struct Labels {
+        pub(super) font: Font,
+        pub(super) x: Label,
+        pub(super) y: Label,
+    }
+
+    impl Default for Labels {
+        fn default() -> Self {
+            Self {
+                font: Font {
+                    size: 16.0,
+                    ..default()
+                },
+                x: default(),
+                y: default(),
+            }
+        }
+    }
+
+    /// Label
+    #[derive(Clone, Deserialize, Serialize)]
+    pub(super) struct Label {
+        pub(super) area_size: f64,
+    }
+
+    impl Default for Label {
+        fn default() -> Self {
+            Self { area_size: 100.0 }
+        }
     }
 }
 
@@ -1022,23 +1299,6 @@ impl From<VLine> for Line {
 impl From<DLine> for Line {
     fn from(value: DLine) -> Self {
         Self::Diagonal(value)
-    }
-}
-
-/// Bounds
-#[derive(Clone, Debug, Default, Deserialize, Hash, Serialize)]
-struct Bounds {
-    x: Range<u64>,
-    y: Range<u64>,
-}
-
-impl Bounds {
-    fn x(&self) -> RangeInclusive<u64> {
-        self.x.start..=self.x.end
-    }
-
-    fn y(&self) -> RangeInclusive<u64> {
-        self.y.start..=self.y.end
     }
 }
 
@@ -1098,57 +1358,49 @@ struct Coordinates {
     y: f64,
 }
 
-/// Visuals
-#[derive(Deserialize, Serialize)]
-struct Visuals {
-    data_aspect: f32,
-    view_aspect: f32,
-    width: f32,
-    height: f32,
-    chart: Chart,
-    x: Division,
-    y: Axes,
-}
+// /// Visuals
+// #[derive(Deserialize, Serialize)]
+// struct Visuals {
+//     data_aspect: f32,
+//     view_aspect: f32,
+//     width: f32,
+//     height: f32,
+//     chart: Chart,
+//     x: Division,
+//     y: Axes,
+// }
 
-impl Default for Visuals {
-    fn default() -> Self {
-        Self {
-            data_aspect: 1.0,
-            view_aspect: 1.0,
-            width: default(),
-            height: default(),
-            chart: default(),
-            x: default(),
-            y: default(),
-        }
-    }
-}
+// impl Default for Visuals {
+//     fn default() -> Self {
+//         Self {
+//             data_aspect: 1.0,
+//             view_aspect: 1.0,
+//             width: default(),
+//             height: default(),
+//             chart: default(),
+//             x: default(),
+//             y: default(),
+//         }
+//     }
+// }
 
 #[derive(Default, Deserialize, Serialize)]
 struct Chart {
     width: f64,
 }
 
-#[derive(Default, Deserialize, Serialize)]
-struct Division {
-    unlabeled: Unlabeled,
-    labeled: Axes,
-}
+// #[derive(Default, Deserialize, Serialize)]
+// struct Division {
+//     unlabeled: Unlabeled,
+//     labeled: Axes,
+// }
 
-#[derive(Default, Deserialize, Serialize)]
-struct Unlabeled {
-    height: f64,
-    width: f32,
-    step: u64,
-}
-
-#[derive(Default, Deserialize, Serialize)]
-struct Axes {
-    font_size: f32,
-    height: f64,
-    width: f32,
-    step: u64,
-}
+// #[derive(Default, Deserialize, Serialize)]
+// struct Unlabeled {
+//     height: f64,
+//     width: f32,
+//     step: u64,
+// }
 
 // mod font {
 //     use egui::FontFamily;
